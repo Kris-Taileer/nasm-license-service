@@ -10,14 +10,14 @@ section .data
     sockaddr_in:
         dw AF_INET          ; sin_family, little-endian
         db 0x11, 0x5C       ; sin_port = 4444 BigEndiAN CUZ IT'S A PORT
-        db 127, 0, 0, 1     ; sin_addr = INADDR_LOCALHOST
+        db 0, 0, 0, 0       ; sin_addr = INADDR_ANY (must accept non-loopback traffic in a container)
         dq 0                ; paddin
 
     menu:
         db "=== License Service ===", 10
         db "REGISTER <name>", 10
         db "LOGIN <name>", 10
-        db "LICENSE <key>", 10
+        db "LICENSE", 10
     menu_len: equ $ - menu
 
     prompt: db "> "
@@ -41,9 +41,6 @@ section .data
     msg_login_fail: db "invalid credentials", 10
     msg_login_fail_len: equ $ - msg_login_fail
 
-    msg_license: db "LICENSE: not implemented yet", 10
-    msg_license_len: equ $ - msg_license
-
     msg_not_logged_in: db "login first", 10
     msg_not_logged_in_len: equ $ - msg_not_logged_in
 
@@ -52,16 +49,22 @@ section .data
 
     db_path: db "accounts.db", 0
 
+    hex_digits_lo: db "0123456789abcdef"
+
 section .bss
     client_buf: resb 256
     name_buf: resb 32
     password_buf: resb 32
-    file_buf: resb 64
+    license_buf: resb 32
+    file_buf: resb 96
     logged_in: resb 1
     session_name: resb 32
+    session_license: resb 32
+    license_hex: resb 65
 
 section .text
     global _start
+    extern license_generate
 
 _start:
     ; socket(AF_INET, SOCK_STREAM, 0)
@@ -185,6 +188,10 @@ reg:
     lea rdx, [password_buf]
     call parse_word
 
+    lea rdi, [name_buf]
+    lea rsi, [license_buf]
+    call license_generate
+
     call db_append_account
 
     mov rax, 1
@@ -240,10 +247,16 @@ license:
     cmp byte [logged_in], 1
     jne .not_logged_in
 
+    lea rdi, [session_license]
+    lea rsi, [license_hex]
+    mov rdx, 32
+    call hex_encode
+    mov byte [license_hex + 64], 10
+
     mov rax, 1
     mov rdi, r13
-    mov rsi, msg_license
-    mov rdx, msg_license_len
+    mov rsi, license_hex
+    mov rdx, 65
     syscall
     jmp client_loop
 
@@ -288,8 +301,6 @@ is_word_boundary:
     cmp al, al
     ret
 
-; in: rdi = src ptr, rsi = remaining length, rdx = dest ptr (32 bytes)
-; out: rax = bytes consumed from src (including delimiter, if any)
 parse_word:
     xor rcx, rcx
 .loop:
@@ -315,7 +326,7 @@ parse_word:
     mov rax, rcx
     ret
 
-; zero-fills dest[rcx..32), preserves rcx
+
 pad_zero:
     push rcx
 .ploop:
@@ -328,44 +339,77 @@ pad_zero:
     pop rcx
     ret
 
-; writes name_buf(32) + password_buf(32) to the end of db_path
+
+hex_encode:
+    push rbx
+    xor rcx, rcx
+.loop:
+    cmp rcx, rdx
+    jge .done
+    mov bl, [rdi + rcx]
+
+    mov al, bl
+    shr al, 4
+    movzx rax, al
+    mov al, [hex_digits_lo + rax]
+    mov [rsi + rcx*2], al
+
+    mov al, bl
+    and al, 0x0F
+    movzx rax, al
+    mov al, [hex_digits_lo + rax]
+    mov [rsi + rcx*2 + 1], al
+
+    inc rcx
+    jmp .loop
+.done:
+    pop rbx
+    ret
+
+; writes name_buf(32) + password_buf(32) + license_buf(32) to db
 db_append_account:
-    mov rax, 2                    ; open
+    mov rax, 2; open
     lea rdi, [db_path]
-    mov rsi, 0x42                 ; O_CREAT | O_RDWR
+    mov rsi, 0x42
     mov rdx, 644o
     syscall
     cmp rax, 0
     jl .fail
     mov r9, rax
 
-    mov rax, 8                    ; lseek
+    mov rax, 8 ; lseek
     mov rdi, r9
     mov rsi, 0
-    mov rdx, 2                    ; SEEK_END
+    mov rdx, 2
     syscall
 
-    mov rax, 1                    ; write name_buf
+    mov rax, 1
     mov rdi, r9
     lea rsi, [name_buf]
     mov rdx, 32
     syscall
 
-    mov rax, 1                    ; write password_buf
+    mov rax, 1
     mov rdi, r9
     lea rsi, [password_buf]
     mov rdx, 32
     syscall
 
-    mov rax, 3                    ; close
+    mov rax, 1
+    mov rdi, r9
+    lea rsi, [license_buf]
+    mov rdx, 32
+    syscall
+
+    mov rax, 3; close
     mov rdi, r9
     syscall
 .fail:
     ret
 
-; looks for a record where name_buf/password_buf match; rax = 1 found, 0 not found
+
 db_find_account:
-    mov rax, 2                    ; open readonly
+    mov rax, 2
     lea rdi, [db_path]
     mov rsi, 0
     mov rdx, 0
@@ -375,12 +419,12 @@ db_find_account:
     mov r9, rax
 
 .read_loop:
-    mov rax, 0                    ; read
+    mov rax, 0
     mov rdi, r9
     lea rsi, [file_buf]
-    mov rdx, 64
+    mov rdx, 96
     syscall
-    cmp rax, 64
+    cmp rax, 96
     jne .close_not_found
 
     xor rcx, rcx
@@ -404,6 +448,15 @@ db_find_account:
     jmp .cmp_pass
 
 .found:
+    xor rcx, rcx
+.copy_license:
+    cmp rcx, 32
+    jge .close_found
+    mov al, [file_buf + 64 + rcx]
+    mov [session_license + rcx], al
+    inc rcx
+    jmp .copy_license
+.close_found:
     mov rax, 3
     mov rdi, r9
     syscall
