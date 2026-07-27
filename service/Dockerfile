@@ -7,8 +7,9 @@ COPY src ./src
 RUN make
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends socat \
-    && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --create-home --home-dir /app --shell /usr/sbin/nologin license
 COPY --from=builder /build/license-service /usr/local/bin/license-service
+WORKDIR /app
+USER license
 EXPOSE 4444
-CMD ["socat", "TCP-LISTEN:4444,reuseaddr,fork", "EXEC:/usr/local/bin/license-service"]
+CMD ["/usr/local/bin/license-service"]
